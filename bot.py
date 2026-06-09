@@ -1,9 +1,12 @@
 import logging
 import json
 import os
+import time
+import signal
+import sys
 from datetime import datetime
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -16,20 +19,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))   # ваш Telegram user_id
-DB_FILE    = os.environ.get("DB_FILE", "data.json") # on fly.io → /data/data.json
+ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
+DB_FILE    = os.environ.get("DB_FILE", "data.json")
 
-# ── Conversation states ──────────────────────────────────────────────────────
+# ── States ───────────────────────────────────────────────────────────────────
 (
     MAIN_MENU,
-    EDIT_NAME, EDIT_PHONE, EDIT_TASKS, ADD_TASK, DELETE_TASK,
-    ADMIN_MENU, ADMIN_VIEW_USER, ADMIN_WRITE_SELECT, ADMIN_WRITE_MSG,
-    BROADCAST_MSG,
-) = range(11)
+    # Account management
+    ADD_ACCOUNT_NAME,
+    # Client management
+    SELECT_ACCOUNT_FOR_CLIENT, ADD_CLIENT_NAME, ADD_CLIENT_PHONE,
+    ADD_CLIENT_INFO, ADD_CLIENT_TASKS,
+    # Edit client
+    EDIT_CLIENT_MENU, EDIT_CLIENT_NAME, EDIT_CLIENT_PHONE,
+    EDIT_CLIENT_INFO, ADD_CLIENT_TASK, DELETE_CLIENT_TASK,
+    # Admin
+    ADMIN_MENU, ADMIN_WRITE_MSG, BROADCAST_MSG,
+) = range(16)
 
-# ── Database helpers ─────────────────────────────────────────────────────────
+# ── DB helpers ────────────────────────────────────────────────────────────────
 def load_db() -> dict:
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
@@ -47,18 +57,24 @@ def get_user(db: dict, uid: int) -> dict:
             "id": uid,
             "username": "",
             "full_name": "",
-            "phone": "",
-            "tasks": [],
+            "accounts": [],          # list of {name, clients:[{name,phone,info,tasks:[]}]}
             "registered_at": datetime.now().isoformat(),
             "last_active": datetime.now().isoformat(),
         }
     db[key]["last_active"] = datetime.now().isoformat()
+    # migrate old format
+    if "accounts" not in db[key]:
+        db[key]["accounts"] = []
     return db[key]
 
-# ── Keyboards ────────────────────────────────────────────────────────────────
+# ── Keyboards ─────────────────────────────────────────────────────────────────
 def main_kb():
     return ReplyKeyboardMarkup(
-        [["📋 Мой блокнот"], ["✏️ Редактировать данные"], ["📋 Мои задачи"]],
+        [
+            ["📋 Мой блокнот"],
+            ["👤 Добавить аккаунт", "➕ Добавить клиента"],
+            ["🗑 Удалить аккаунт"],
+        ],
         resize_keyboard=True,
     )
 
@@ -71,7 +87,7 @@ def admin_kb():
 def back_kb():
     return ReplyKeyboardMarkup([["🔙 Назад"]], resize_keyboard=True)
 
-# ── /start ───────────────────────────────────────────────────────────────────
+# ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db = load_db()
@@ -82,208 +98,523 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if user.id == ADMIN_ID:
         await update.message.reply_text(
-            f"👑 Добро пожаловать, Админ!\n\nВыберите действие:",
+            "👑 Добро пожаловать, Админ!\n\nВыберите действие:",
             reply_markup=admin_kb(),
         )
         return ADMIN_MENU
 
     await update.message.reply_text(
         f"👋 Привет, {user.first_name}!\n\n"
-        "Здесь ты можешь вести свой личный блокнот:\n"
-        "• Сохранять контактные данные\n"
-        "• Вести список задач\n\n"
-        "Выбери действие в меню 👇",
+        "Это твой блокнот для работы с клиентами.\n\n"
+        "• Создай аккаунт (например «Миша» или «Саша»)\n"
+        "• Добавляй клиентов к каждому аккаунту\n"
+        "• Веди заметки и задачи по каждому клиенту\n\n"
+        "Выбери действие 👇",
         reply_markup=main_kb(),
     )
     return MAIN_MENU
 
-# ─────────────────────────────────────────────────────────────────────────────
-# USER SECTION
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ═════════════════════════════════════════════════════════════════════════════
+# NOTEBOOK — show all accounts and their clients
+# ═════════════════════════════════════════════════════════════════════════════
 async def show_notebook(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     u  = get_user(db, update.effective_user.id)
-    tasks_text = ""
-    if u["tasks"]:
-        tasks_text = "\n\n📋 *Задачи:*\n" + "\n".join(
-            f"  {'✅' if t.get('done') else '⬜'} {i+1}. {t['text']}"
-            for i, t in enumerate(u["tasks"])
+    accounts = u.get("accounts", [])
+
+    if not accounts:
+        await update.message.reply_text(
+            "📓 Блокнот пуст.\n\nДобавь аккаунт кнопкой «👤 Добавить аккаунт».",
+            reply_markup=main_kb(),
         )
-    else:
-        tasks_text = "\n\n📋 *Задачи:* пусто"
-
-    text = (
-        f"📓 *Твой блокнот*\n\n"
-        f"👤 *Имя:* {u['full_name'] or '—'}\n"
-        f"📞 *Телефон:* {u['phone'] or '—'}"
-        f"{tasks_text}"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_kb())
-    return MAIN_MENU
-
-async def edit_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 Изменить имя",    callback_data="edit_name")],
-        [InlineKeyboardButton("📞 Изменить телефон", callback_data="edit_phone")],
-        [InlineKeyboardButton("➕ Добавить задачу",  callback_data="add_task")],
-        [InlineKeyboardButton("🗑 Удалить задачу",   callback_data="del_task")],
-    ])
-    await update.message.reply_text("Что хочешь изменить?", reply_markup=kb)
-    return MAIN_MENU
-
-async def tasks_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    db = load_db()
-    u  = get_user(db, update.effective_user.id)
-    if not u["tasks"]:
-        await update.message.reply_text("Список задач пуст. Добавь через «Редактировать данные».", reply_markup=main_kb())
         return MAIN_MENU
 
-    kb_rows = []
-    for i, t in enumerate(u["tasks"]):
-        icon = "✅" if t.get("done") else "⬜"
-        kb_rows.append([InlineKeyboardButton(f"{icon} {t['text']}", callback_data=f"toggle_{i}")])
+    lines = ["📓 *Твой блокнот*\n"]
+    for ai, acc in enumerate(accounts):
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"👤 *Аккаунт: {acc['name']}*")
+        clients = acc.get("clients", [])
+        if not clients:
+            lines.append("  _(клиентов нет)_")
+        else:
+            for ci, cl in enumerate(clients):
+                lines.append(f"\n  📌 *Клиент {ci+1}: {cl.get('name','—')}*")
+                lines.append(f"  📞 Телефон: {cl.get('phone','—')}")
+                lines.append(f"  ℹ️ Инфо: {cl.get('info','—')}")
+                tasks = cl.get("tasks", [])
+                if tasks:
+                    lines.append("  📋 Задачи:")
+                    for ti, t in enumerate(tasks):
+                        icon = "✅" if t.get("done") else "⬜"
+                        lines.append(f"    {icon} {ti+1}. {t['text']}")
+                else:
+                    lines.append("  📋 Задачи: —")
+        lines.append("")
 
+    text = "\n".join(lines)
+
+    # Telegram message limit is 4096 chars — split if needed
+    if len(text) <= 4096:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_kb())
+    else:
+        chunks = []
+        current = ""
+        for line in lines:
+            if len(current) + len(line) + 1 > 4000:
+                chunks.append(current)
+                current = line + "\n"
+            else:
+                current += line + "\n"
+        if current:
+            chunks.append(current)
+        for i, chunk in enumerate(chunks):
+            kb = main_kb() if i == len(chunks) - 1 else None
+            await update.message.reply_text(chunk, parse_mode="Markdown", reply_markup=kb)
+
+    return MAIN_MENU
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ADD ACCOUNT
+# ═════════════════════════════════════════════════════════════════════════════
+async def add_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📋 *Твои задачи*\nНажми на задачу чтобы отметить выполненной:",
+        "Введи название аккаунта (например: «Миша», «Саша», «Работа»):",
+        reply_markup=back_kb(),
+    )
+    return ADD_ACCOUNT_NAME
+
+async def add_account_save(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🔙 Назад":
+        await update.message.reply_text("Отменено.", reply_markup=main_kb())
+        return MAIN_MENU
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Название не может быть пустым. Попробуй снова:")
+        return ADD_ACCOUNT_NAME
+    db = load_db()
+    u  = get_user(db, update.effective_user.id)
+    u["accounts"].append({"name": name, "clients": []})
+    save_db(db)
+    await update.message.reply_text(
+        f"✅ Аккаунт *{name}* создан!\n\nТеперь добавь клиентов через «➕ Добавить клиента».",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb_rows),
+        reply_markup=main_kb(),
     )
     return MAIN_MENU
 
-# Inline callback handlers
+# ═════════════════════════════════════════════════════════════════════════════
+# DELETE ACCOUNT
+# ═════════════════════════════════════════════════════════════════════════════
+async def delete_account_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    u  = get_user(db, update.effective_user.id)
+    accounts = u.get("accounts", [])
+    if not accounts:
+        await update.message.reply_text("Аккаунтов нет.", reply_markup=main_kb())
+        return MAIN_MENU
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🗑 {acc['name']}", callback_data=f"delacc_{ai}")]
+        for ai, acc in enumerate(accounts)
+    ])
+    await update.message.reply_text("Какой аккаунт удалить? (вместе со всеми клиентами)", reply_markup=kb)
+    return MAIN_MENU
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ADD CLIENT — step by step
+# ═════════════════════════════════════════════════════════════════════════════
+async def add_client_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    u  = get_user(db, update.effective_user.id)
+    accounts = u.get("accounts", [])
+    if not accounts:
+        await update.message.reply_text(
+            "Сначала создай аккаунт кнопкой «👤 Добавить аккаунт».",
+            reply_markup=main_kb(),
+        )
+        return MAIN_MENU
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"👤 {acc['name']}", callback_data=f"selaccount_{ai}")]
+        for ai, acc in enumerate(accounts)
+    ])
+    await update.message.reply_text("К какому аккаунту добавить клиента?", reply_markup=kb)
+    return SELECT_ACCOUNT_FOR_CLIENT
+
+async def client_account_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ai = int(q.data.split("_")[1])
+    ctx.user_data["new_client_account_idx"] = ai
+    ctx.user_data["new_client"] = {}
+    await q.message.reply_text("Введи имя клиента:", reply_markup=back_kb())
+    return ADD_CLIENT_NAME
+
+async def add_client_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🔙 Назад":
+        await update.message.reply_text("Отменено.", reply_markup=main_kb())
+        ctx.user_data.clear()
+        return MAIN_MENU
+    ctx.user_data["new_client"]["name"] = update.message.text.strip()
+    await update.message.reply_text("Введи номер телефона (или напиши «-» если нет):", reply_markup=back_kb())
+    return ADD_CLIENT_PHONE
+
+async def add_client_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🔙 Назад":
+        await update.message.reply_text("Отменено.", reply_markup=main_kb())
+        ctx.user_data.clear()
+        return MAIN_MENU
+    val = update.message.text.strip()
+    ctx.user_data["new_client"]["phone"] = "" if val == "-" else val
+    await update.message.reply_text("Введи информацию о клиенте (или «-»):", reply_markup=back_kb())
+    return ADD_CLIENT_INFO
+
+async def add_client_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🔙 Назад":
+        await update.message.reply_text("Отменено.", reply_markup=main_kb())
+        ctx.user_data.clear()
+        return MAIN_MENU
+    val = update.message.text.strip()
+    ctx.user_data["new_client"]["info"] = "" if val == "-" else val
+    await update.message.reply_text(
+        "Введи задачи по клиенту — *каждую с новой строки*.\n"
+        "Или напиши «-» если задач пока нет:",
+        parse_mode="Markdown",
+        reply_markup=back_kb(),
+    )
+    return ADD_CLIENT_TASKS
+
+async def add_client_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🔙 Назад":
+        await update.message.reply_text("Отменено.", reply_markup=main_kb())
+        ctx.user_data.clear()
+        return MAIN_MENU
+    val = update.message.text.strip()
+    if val == "-":
+        tasks = []
+    else:
+        tasks = [
+            {"text": line.strip(), "done": False, "created_at": datetime.now().isoformat()}
+            for line in val.splitlines() if line.strip()
+        ]
+    ctx.user_data["new_client"]["tasks"] = tasks
+
+    # Save
+    db  = load_db()
+    u   = get_user(db, update.effective_user.id)
+    ai  = ctx.user_data.get("new_client_account_idx", 0)
+    cl  = ctx.user_data["new_client"]
+    if ai < len(u["accounts"]):
+        u["accounts"][ai]["clients"].append(cl)
+        save_db(db)
+        acc_name = u["accounts"][ai]["name"]
+        await update.message.reply_text(
+            f"✅ Клиент *{cl['name']}* добавлен в аккаунт *{acc_name}*!\n\n"
+            "Нажми «📋 Мой блокнот» чтобы посмотреть.",
+            parse_mode="Markdown",
+            reply_markup=main_kb(),
+        )
+    else:
+        await update.message.reply_text("Ошибка: аккаунт не найден.", reply_markup=main_kb())
+
+    ctx.user_data.clear()
+    return MAIN_MENU
+
+# ═════════════════════════════════════════════════════════════════════════════
+# INLINE CALLBACKS
+# ═════════════════════════════════════════════════════════════════════════════
 async def inline_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
     data = q.data
     await q.answer()
 
-    if data == "edit_name":
-        await q.message.reply_text("Введи своё имя:", reply_markup=back_kb())
-        ctx.user_data["editing"] = "name"
-        return EDIT_NAME
-
-    if data == "edit_phone":
-        await q.message.reply_text("Введи номер телефона:", reply_markup=back_kb())
-        ctx.user_data["editing"] = "phone"
-        return EDIT_PHONE
-
-    if data == "add_task":
-        await q.message.reply_text("Введи текст задачи:", reply_markup=back_kb())
-        return ADD_TASK
-
-    if data == "del_task":
-        db = load_db()
-        u  = get_user(db, q.from_user.id)
-        if not u["tasks"]:
-            await q.message.reply_text("Задач нет.", reply_markup=main_kb())
-            return MAIN_MENU
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🗑 {t['text']}", callback_data=f"deltask_{i}")]
-            for i, t in enumerate(u["tasks"])
-        ])
-        await q.message.reply_text("Какую задачу удалить?", reply_markup=kb)
-        return DELETE_TASK
-
-    if data.startswith("toggle_"):
-        idx = int(data.split("_")[1])
+    # ── Delete account ──
+    if data.startswith("delacc_"):
+        ai  = int(data.split("_")[1])
         db  = load_db()
         u   = get_user(db, q.from_user.id)
-        if idx < len(u["tasks"]):
-            u["tasks"][idx]["done"] = not u["tasks"][idx].get("done", False)
+        if ai < len(u["accounts"]):
+            removed = u["accounts"].pop(ai)
             save_db(db)
-            await q.edit_message_text(
-                "✅ Статус обновлён!\n\nОткрой «Мой блокнот» чтобы увидеть изменения."
+            await q.message.reply_text(
+                f"🗑 Аккаунт *{removed['name']}* удалён.",
+                parse_mode="Markdown",
+                reply_markup=main_kb(),
             )
         return MAIN_MENU
 
-    if data.startswith("deltask_"):
-        idx = int(data.split("_")[1])
-        db  = load_db()
-        u   = get_user(db, q.from_user.id)
-        if idx < len(u["tasks"]):
-            removed = u["tasks"].pop(idx)
-            save_db(db)
-            await q.edit_message_text(f"🗑 Задача «{removed['text']}» удалена.")
+    # ── Account selected for new client ──
+    if data.startswith("selaccount_"):
+        ai = int(data.split("_")[1])
+        ctx.user_data["new_client_account_idx"] = ai
+        ctx.user_data["new_client"] = {}
+        await q.message.reply_text("Введи имя клиента:", reply_markup=back_kb())
+        return ADD_CLIENT_NAME
+
+    # ── View client detail (with edit/task buttons) ──
+    if data.startswith("viewclient_"):
+        _, ai, ci = data.split("_")
+        ai, ci = int(ai), int(ci)
+        db = load_db()
+        u  = get_user(db, q.from_user.id)
+        try:
+            acc = u["accounts"][ai]
+            cl  = acc["clients"][ci]
+        except (IndexError, KeyError):
+            await q.message.reply_text("Клиент не найден.")
+            return MAIN_MENU
+
+        tasks = cl.get("tasks", [])
+        tasks_text = "\n".join(
+            f"  {'✅' if t.get('done') else '⬜'} {ti+1}. {t['text']}"
+            for ti, t in enumerate(tasks)
+        ) or "  —"
+
+        text = (
+            f"👤 *Аккаунт:* {acc['name']}\n"
+            f"📌 *Клиент:* {cl.get('name','—')}\n"
+            f"📞 *Телефон:* {cl.get('phone','—')}\n"
+            f"ℹ️ *Инфо:* {cl.get('info','—')}\n\n"
+            f"📋 *Задачи:*\n{tasks_text}"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Изменить имя",    callback_data=f"edn_{ai}_{ci}"),
+             InlineKeyboardButton("📞 Изменить телефон", callback_data=f"edp_{ai}_{ci}")],
+            [InlineKeyboardButton("ℹ️ Изменить инфо",   callback_data=f"edi_{ai}_{ci}")],
+            [InlineKeyboardButton("➕ Добавить задачу",  callback_data=f"addt_{ai}_{ci}"),
+             InlineKeyboardButton("🗑 Удалить задачу",   callback_data=f"delt_{ai}_{ci}")],
+            [InlineKeyboardButton("🗑 Удалить клиента",  callback_data=f"delcl_{ai}_{ci}")],
+            [InlineKeyboardButton("✅ Отметить задачи",  callback_data=f"togglemenu_{ai}_{ci}")],
+        ])
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
         return MAIN_MENU
 
-    # ── Admin inline callbacks ──
+    # ── Delete client ──
+    if data.startswith("delcl_"):
+        _, ai, ci = data.split("_")
+        ai, ci = int(ai), int(ci)
+        db = load_db()
+        u  = get_user(db, q.from_user.id)
+        try:
+            removed = u["accounts"][ai]["clients"].pop(ci)
+            save_db(db)
+            await q.message.reply_text(f"🗑 Клиент *{removed['name']}* удалён.", parse_mode="Markdown")
+        except (IndexError, KeyError):
+            await q.message.reply_text("Ошибка.")
+        return MAIN_MENU
+
+    # ── Edit client fields ──
+    if data.startswith("edn_"):
+        _, ai, ci = data.split("_")
+        ctx.user_data["edit_ai"] = int(ai)
+        ctx.user_data["edit_ci"] = int(ci)
+        ctx.user_data["edit_field"] = "name"
+        await q.message.reply_text("Введи новое имя клиента:", reply_markup=back_kb())
+        return EDIT_CLIENT_NAME
+
+    if data.startswith("edp_"):
+        _, ai, ci = data.split("_")
+        ctx.user_data["edit_ai"] = int(ai)
+        ctx.user_data["edit_ci"] = int(ci)
+        await q.message.reply_text("Введи новый телефон:", reply_markup=back_kb())
+        return EDIT_CLIENT_PHONE
+
+    if data.startswith("edi_"):
+        _, ai, ci = data.split("_")
+        ctx.user_data["edit_ai"] = int(ai)
+        ctx.user_data["edit_ci"] = int(ci)
+        await q.message.reply_text("Введи новую информацию:", reply_markup=back_kb())
+        return EDIT_CLIENT_INFO
+
+    # ── Add task to existing client ──
+    if data.startswith("addt_"):
+        _, ai, ci = data.split("_")
+        ctx.user_data["edit_ai"] = int(ai)
+        ctx.user_data["edit_ci"] = int(ci)
+        await q.message.reply_text("Введи текст задачи:", reply_markup=back_kb())
+        return ADD_CLIENT_TASK
+
+    # ── Delete task menu ──
+    if data.startswith("delt_"):
+        _, ai, ci = data.split("_")
+        ai, ci = int(ai), int(ci)
+        db = load_db()
+        u  = get_user(db, q.from_user.id)
+        try:
+            tasks = u["accounts"][ai]["clients"][ci].get("tasks", [])
+        except (IndexError, KeyError):
+            await q.message.reply_text("Ошибка.")
+            return MAIN_MENU
+        if not tasks:
+            await q.message.reply_text("Задач нет.")
+            return MAIN_MENU
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🗑 {t['text'][:40]}", callback_data=f"deltask_{ai}_{ci}_{ti}")]
+            for ti, t in enumerate(tasks)
+        ])
+        await q.message.reply_text("Какую задачу удалить?", reply_markup=kb)
+        return MAIN_MENU
+
+    if data.startswith("deltask_"):
+        parts = data.split("_")
+        ai, ci, ti = int(parts[1]), int(parts[2]), int(parts[3])
+        db = load_db()
+        u  = get_user(db, q.from_user.id)
+        try:
+            removed = u["accounts"][ai]["clients"][ci]["tasks"].pop(ti)
+            save_db(db)
+            await q.edit_message_text(f"🗑 Задача «{removed['text']}» удалена.")
+        except (IndexError, KeyError):
+            await q.message.reply_text("Ошибка.")
+        return MAIN_MENU
+
+    # ── Toggle task menu ──
+    if data.startswith("togglemenu_"):
+        _, ai, ci = data.split("_")
+        ai, ci = int(ai), int(ci)
+        db = load_db()
+        u  = get_user(db, q.from_user.id)
+        try:
+            tasks = u["accounts"][ai]["clients"][ci].get("tasks", [])
+        except (IndexError, KeyError):
+            await q.message.reply_text("Ошибка.")
+            return MAIN_MENU
+        if not tasks:
+            await q.message.reply_text("Задач нет.")
+            return MAIN_MENU
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"{'✅' if t.get('done') else '⬜'} {t['text'][:40]}",
+                callback_data=f"tog_{ai}_{ci}_{ti}"
+            )]
+            for ti, t in enumerate(tasks)
+        ])
+        await q.message.reply_text("Нажми на задачу чтобы отметить:", reply_markup=kb)
+        return MAIN_MENU
+
+    if data.startswith("tog_"):
+        parts = data.split("_")
+        ai, ci, ti = int(parts[1]), int(parts[2]), int(parts[3])
+        db = load_db()
+        u  = get_user(db, q.from_user.id)
+        try:
+            task = u["accounts"][ai]["clients"][ci]["tasks"][ti]
+            task["done"] = not task.get("done", False)
+            save_db(db)
+            status = "✅ Выполнена" if task["done"] else "⬜ Не выполнена"
+            await q.edit_message_text(f"{status}: «{task['text']}»")
+        except (IndexError, KeyError):
+            await q.message.reply_text("Ошибка.")
+        return MAIN_MENU
+
+    # ── Admin: view user ──
     if data.startswith("viewuser_"):
         uid = int(data.split("_")[1])
         db  = load_db()
         u   = db.get(str(uid), {})
-        tasks_text = "\n".join(
-            f"  {'✅' if t.get('done') else '⬜'} {t['text']}" for t in u.get("tasks", [])
-        ) or "  —"
-        text = (
-            f"👤 *{u.get('full_name','—')}* (@{u.get('username','—')})\n"
-            f"🆔 ID: `{uid}`\n"
-            f"📞 Телефон: {u.get('phone','—')}\n"
-            f"🕐 Последняя активность: {u.get('last_active','—')[:16]}\n\n"
-            f"📋 Задачи:\n{tasks_text}"
-        )
+        accounts = u.get("accounts", [])
+        lines = [f"👤 *{u.get('full_name','—')}* (@{u.get('username','—')})\n🆔 `{uid}`\n"]
+        if not accounts:
+            lines.append("_Аккаунтов нет_")
+        else:
+            for acc in accounts:
+                lines.append(f"━━━━ 👤 {acc['name']} ━━━━")
+                for ci, cl in enumerate(acc.get("clients", [])):
+                    lines.append(f"  📌 Клиент {ci+1}: {cl.get('name','—')}")
+                    lines.append(f"  📞 {cl.get('phone','—')}  ℹ️ {cl.get('info','—')}")
+        text = "\n".join(lines)
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("✉️ Написать", callback_data=f"msguser_{uid}")
         ]])
-        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        await q.message.reply_text(text[:4096], parse_mode="Markdown", reply_markup=kb)
         return ADMIN_MENU
 
     if data.startswith("msguser_"):
         ctx.user_data["target_uid"] = int(data.split("_")[1])
-        await q.message.reply_text("Введи сообщение для этого менеджера:", reply_markup=back_kb())
+        await q.message.reply_text("Введи сообщение для этого пользователя:", reply_markup=back_kb())
         return ADMIN_WRITE_MSG
 
     return MAIN_MENU
 
-async def save_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── Edit client field handlers ────────────────────────────────────────────────
+async def edit_client_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "🔙 Назад":
         await update.message.reply_text("Отменено.", reply_markup=main_kb())
         return MAIN_MENU
     db = load_db()
     u  = get_user(db, update.effective_user.id)
-    u["full_name"] = update.message.text.strip()
-    save_db(db)
-    await update.message.reply_text(f"✅ Имя сохранено: *{u['full_name']}*", parse_mode="Markdown", reply_markup=main_kb())
+    ai = ctx.user_data.get("edit_ai", 0)
+    ci = ctx.user_data.get("edit_ci", 0)
+    try:
+        u["accounts"][ai]["clients"][ci]["name"] = update.message.text.strip()
+        save_db(db)
+        await update.message.reply_text("✅ Имя клиента обновлено.", reply_markup=main_kb())
+    except (IndexError, KeyError):
+        await update.message.reply_text("Ошибка.", reply_markup=main_kb())
     return MAIN_MENU
 
-async def save_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def edit_client_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "🔙 Назад":
         await update.message.reply_text("Отменено.", reply_markup=main_kb())
         return MAIN_MENU
     db = load_db()
     u  = get_user(db, update.effective_user.id)
-    u["phone"] = update.message.text.strip()
-    save_db(db)
-    await update.message.reply_text(f"✅ Телефон сохранён: *{u['phone']}*", parse_mode="Markdown", reply_markup=main_kb())
+    ai = ctx.user_data.get("edit_ai", 0)
+    ci = ctx.user_data.get("edit_ci", 0)
+    try:
+        u["accounts"][ai]["clients"][ci]["phone"] = update.message.text.strip()
+        save_db(db)
+        await update.message.reply_text("✅ Телефон обновлён.", reply_markup=main_kb())
+    except (IndexError, KeyError):
+        await update.message.reply_text("Ошибка.", reply_markup=main_kb())
     return MAIN_MENU
 
-async def save_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def edit_client_info(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "🔙 Назад":
         await update.message.reply_text("Отменено.", reply_markup=main_kb())
         return MAIN_MENU
     db = load_db()
     u  = get_user(db, update.effective_user.id)
-    task_text = update.message.text.strip()
-    u["tasks"].append({"text": task_text, "done": False, "created_at": datetime.now().isoformat()})
-    save_db(db)
-    await update.message.reply_text(f"✅ Задача добавлена: *{task_text}*", parse_mode="Markdown", reply_markup=main_kb())
+    ai = ctx.user_data.get("edit_ai", 0)
+    ci = ctx.user_data.get("edit_ci", 0)
+    try:
+        u["accounts"][ai]["clients"][ci]["info"] = update.message.text.strip()
+        save_db(db)
+        await update.message.reply_text("✅ Информация обновлена.", reply_markup=main_kb())
+    except (IndexError, KeyError):
+        await update.message.reply_text("Ошибка.", reply_markup=main_kb())
     return MAIN_MENU
 
-# ─────────────────────────────────────────────────────────────────────────────
+async def add_client_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🔙 Назад":
+        await update.message.reply_text("Отменено.", reply_markup=main_kb())
+        return MAIN_MENU
+    db = load_db()
+    u  = get_user(db, update.effective_user.id)
+    ai = ctx.user_data.get("edit_ai", 0)
+    ci = ctx.user_data.get("edit_ci", 0)
+    try:
+        task_text = update.message.text.strip()
+        u["accounts"][ai]["clients"][ci].setdefault("tasks", []).append(
+            {"text": task_text, "done": False, "created_at": datetime.now().isoformat()}
+        )
+        save_db(db)
+        await update.message.reply_text(f"✅ Задача добавлена: *{task_text}*", parse_mode="Markdown", reply_markup=main_kb())
+    except (IndexError, KeyError):
+        await update.message.reply_text("Ошибка.", reply_markup=main_kb())
+    return MAIN_MENU
+
+# ═════════════════════════════════════════════════════════════════════════════
 # ADMIN SECTION
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ═════════════════════════════════════════════════════════════════════════════
 async def admin_all_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db = load_db()
     users = [v for k, v in db.items() if v.get("id") != ADMIN_ID]
     if not users:
         await update.message.reply_text("Пользователей пока нет.", reply_markup=admin_kb())
         return ADMIN_MENU
-
     kb_rows = []
     for u in users:
         label = f"👤 {u.get('full_name') or u.get('username') or str(u['id'])}"
         kb_rows.append([InlineKeyboardButton(label, callback_data=f"viewuser_{u['id']}")])
-
     await update.message.reply_text(
         f"👥 *Все пользователи* ({len(users)}):",
         parse_mode="Markdown",
@@ -297,12 +628,13 @@ async def admin_write_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not users:
         await update.message.reply_text("Пользователей нет.", reply_markup=admin_kb())
         return ADMIN_MENU
-
-    kb_rows = []
-    for u in users:
-        label = f"✉️ {u.get('full_name') or u.get('username') or str(u['id'])}"
-        kb_rows.append([InlineKeyboardButton(label, callback_data=f"msguser_{u['id']}")])
-
+    kb_rows = [
+        [InlineKeyboardButton(
+            f"✉️ {u.get('full_name') or u.get('username') or str(u['id'])}",
+            callback_data=f"msguser_{u['id']}"
+        )]
+        for u in users
+    ]
     await update.message.reply_text("Кому написать?", reply_markup=InlineKeyboardMarkup(kb_rows))
     return ADMIN_MENU
 
@@ -310,12 +642,10 @@ async def admin_send_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "🔙 Назад":
         await update.message.reply_text("Отменено.", reply_markup=admin_kb())
         return ADMIN_MENU
-
     target_uid = ctx.user_data.get("target_uid")
     if not target_uid:
         await update.message.reply_text("Ошибка: не выбран получатель.", reply_markup=admin_kb())
         return ADMIN_MENU
-
     try:
         await ctx.bot.send_message(
             chat_id=target_uid,
@@ -324,8 +654,7 @@ async def admin_send_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text("✅ Сообщение отправлено!", reply_markup=admin_kb())
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при отправке: {e}", reply_markup=admin_kb())
-
+        await update.message.reply_text(f"❌ Ошибка: {e}", reply_markup=admin_kb())
     ctx.user_data.pop("target_uid", None)
     return ADMIN_MENU
 
@@ -337,7 +666,6 @@ async def admin_broadcast_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "🔙 Назад":
         await update.message.reply_text("Отменено.", reply_markup=admin_kb())
         return ADMIN_MENU
-
     db = load_db()
     users = [v for k, v in db.items() if v.get("id") != ADMIN_ID]
     ok, fail = 0, 0
@@ -351,14 +679,13 @@ async def admin_broadcast_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ok += 1
         except:
             fail += 1
-
     await update.message.reply_text(
         f"📢 Рассылка завершена!\n✅ Доставлено: {ok}\n❌ Ошибок: {fail}",
         reply_markup=admin_kb(),
     )
     return ADMIN_MENU
 
-# ── Fallback ─────────────────────────────────────────────────────────────────
+# ── Fallback ──────────────────────────────────────────────────────────────────
 async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid == ADMIN_ID:
@@ -375,15 +702,22 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             MAIN_MENU: [
-                MessageHandler(filters.Regex("^📋 Мой блокнот$"),          show_notebook),
-                MessageHandler(filters.Regex("^✏️ Редактировать данные$"), edit_menu),
-                MessageHandler(filters.Regex("^📋 Мои задачи$"),           tasks_menu),
+                MessageHandler(filters.Regex("^📋 Мой блокнот$"),        show_notebook),
+                MessageHandler(filters.Regex("^👤 Добавить аккаунт$"),   add_account_start),
+                MessageHandler(filters.Regex("^➕ Добавить клиента$"),   add_client_start),
+                MessageHandler(filters.Regex("^🗑 Удалить аккаунт$"),    delete_account_start),
                 CallbackQueryHandler(inline_handler),
             ],
-            EDIT_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, save_name)],
-            EDIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_phone)],
-            ADD_TASK:   [MessageHandler(filters.TEXT & ~filters.COMMAND, save_task)],
-            DELETE_TASK:[CallbackQueryHandler(inline_handler)],
+            ADD_ACCOUNT_NAME:          [MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_save)],
+            SELECT_ACCOUNT_FOR_CLIENT: [CallbackQueryHandler(client_account_selected)],
+            ADD_CLIENT_NAME:           [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_name)],
+            ADD_CLIENT_PHONE:          [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_phone)],
+            ADD_CLIENT_INFO:           [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_info)],
+            ADD_CLIENT_TASKS:          [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_tasks)],
+            EDIT_CLIENT_NAME:          [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_client_name)],
+            EDIT_CLIENT_PHONE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_client_phone)],
+            EDIT_CLIENT_INFO:          [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_client_info)],
+            ADD_CLIENT_TASK:           [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_task)],
             ADMIN_MENU: [
                 MessageHandler(filters.Regex("^👥 Все пользователи$"),   admin_all_users),
                 MessageHandler(filters.Regex("^✉️ Написать менеджеру$"), admin_write_select),
@@ -402,7 +736,29 @@ def main():
 
     app.add_handler(conv)
     logger.info("Бот запущен...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
+
+# ── Resilient entry point — restarts bot on any crash ─────────────────────────
+def run_forever():
+    RETRY_DELAY = 5
+    MAX_DELAY   = 60
+    delay = RETRY_DELAY
+    while True:
+        try:
+            logger.info("▶ Запуск бота...")
+            main()
+            logger.warning("main() вернулась, перезапуск через %ds...", delay)
+        except KeyboardInterrupt:
+            logger.info("Остановлен вручную (Ctrl+C).")
+            sys.exit(0)
+        except Exception as exc:
+            logger.exception("💥 Ошибка: %s. Перезапуск через %ds...", exc, delay)
+        time.sleep(delay)
+        delay = min(delay * 2, MAX_DELAY)
 
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    run_forever()
