@@ -1,38 +1,14 @@
-app = "telegram-bot"
+app = "my-tg--bot"
 primary_region = "fra"
 
 [build]
 
 [env]
-  # Non-secret env vars go here. Secrets are set via: fly secrets set KEY=value
+  DB_FILE = "/data/data.json"
 
-# Worker process — no HTTP server needed for a polling bot
-[processes]
-  app = "python bot.py"
-
-# Disable the default HTTP service (polling bot doesn't need a port)
-[[services]]
-  # Keep a minimal TCP check disabled — polling bot needs no inbound ports
-  internal_port = 8080
-  protocol = "tcp"
-  auto_stop_machines = false
-  auto_start_machines = true
-  min_machines_running = 1
-
-  # No HTTP handlers needed for polling mode
-  # If you ever switch to webhooks, uncomment and configure below:
-  # [[services.http_checks]]
-  #   interval = "10s"
-  #   timeout = "5s"
-  #   grace_period = "10s"
-  #   path = "/healthz"
-
-[[vm]]
-  memory = "256mb"
-  cpu_kind = "shared"
-  cpus = 1
-
-[mounts]
-  # Persistent volume to survive restarts — stores data.json
+[[mounts]]
   source = "bot_data"
   destination = "/data"
+
+[processes]
+  app = "python bot.py"
