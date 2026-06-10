@@ -37,7 +37,9 @@ DB_FILE    = os.environ.get("DB_FILE", "data.json")
     EDIT_CLIENT_INFO, ADD_CLIENT_TASK, DELETE_CLIENT_TASK,
     # Admin
     ADMIN_MENU, ADMIN_WRITE_MSG, BROADCAST_MSG,
-) = range(16)
+    # Edit client via button flow
+    EDIT_SELECT_ACCOUNT, EDIT_SELECT_CLIENT, EDIT_FIELD_VALUE,
+) = range(19)
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def load_db() -> dict:
@@ -57,12 +59,11 @@ def get_user(db: dict, uid: int) -> dict:
             "id": uid,
             "username": "",
             "full_name": "",
-            "accounts": [],          # list of {name, clients:[{name,phone,info,tasks:[]}]}
+            "accounts": [],
             "registered_at": datetime.now().isoformat(),
             "last_active": datetime.now().isoformat(),
         }
     db[key]["last_active"] = datetime.now().isoformat()
-    # migrate old format
     if "accounts" not in db[key]:
         db[key]["accounts"] = []
     return db[key]
@@ -73,6 +74,7 @@ def main_kb():
         [
             ["📋 Мой блокнот"],
             ["👤 Добавить аккаунт", "➕ Добавить клиента"],
+            ["✏️ Редактировать клиента"],
             ["🗑 Удалить аккаунт"],
         ],
         resize_keyboard=True,
@@ -115,7 +117,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 # ═════════════════════════════════════════════════════════════════════════════
-# NOTEBOOK — show all accounts and their clients
+# NOTEBOOK
 # ═════════════════════════════════════════════════════════════════════════════
 async def show_notebook(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db = load_db()
@@ -153,7 +155,6 @@ async def show_notebook(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = "\n".join(lines)
 
-    # Telegram message limit is 4096 chars — split if needed
     if len(text) <= 4096:
         await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_kb())
     else:
@@ -297,7 +298,6 @@ async def add_client_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]
     ctx.user_data["new_client"]["tasks"] = tasks
 
-    # Save
     db  = load_db()
     u   = get_user(db, update.effective_user.id)
     ai  = ctx.user_data.get("new_client_account_idx", 0)
@@ -319,12 +319,238 @@ async def add_client_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return MAIN_MENU
 
 # ═════════════════════════════════════════════════════════════════════════════
-# INLINE CALLBACKS
+# ✏️ РЕДАКТИРОВАТЬ КЛИЕНТА — новый flow через кнопку в главном меню
+# ═════════════════════════════════════════════════════════════════════════════
+async def edit_client_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: показываем список аккаунтов кнопками"""
+    db = load_db()
+    u  = get_user(db, update.effective_user.id)
+    accounts = u.get("accounts", [])
+
+    if not accounts:
+        await update.message.reply_text("Аккаунтов нет. Сначала создай аккаунт.", reply_markup=main_kb())
+        return MAIN_MENU
+
+    # Проверяем, есть ли хоть один клиент
+    has_clients = any(acc.get("clients") for acc in accounts)
+    if not has_clients:
+        await update.message.reply_text("Клиентов ещё нет. Сначала добавь клиента.", reply_markup=main_kb())
+        return MAIN_MENU
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"👤 {acc['name']} ({len(acc.get('clients',[]))} кл.)",
+                              callback_data=f"editacc_{ai}")]
+        for ai, acc in enumerate(accounts)
+        if acc.get("clients")
+    ])
+    await update.message.reply_text("Выбери аккаунт:", reply_markup=kb)
+    return EDIT_SELECT_ACCOUNT
+
+async def edit_select_account_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Шаг 2: показываем клиентов выбранного аккаунта кнопками"""
+    q = update.callback_query
+    await q.answer()
+    ai = int(q.data.split("_")[1])
+    ctx.user_data["edit_ai"] = ai
+
+    db = load_db()
+    u  = get_user(db, q.from_user.id)
+    try:
+        acc = u["accounts"][ai]
+    except IndexError:
+        await q.message.reply_text("Ошибка: аккаунт не найден.", reply_markup=main_kb())
+        return MAIN_MENU
+
+    clients = acc.get("clients", [])
+    if not clients:
+        await q.message.reply_text("В этом аккаунте нет клиентов.", reply_markup=main_kb())
+        return MAIN_MENU
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📌 {cl.get('name','—')}", callback_data=f"editcl_{ai}_{ci}")]
+        for ci, cl in enumerate(clients)
+    ])
+    await q.message.reply_text(f"Выбери клиента из аккаунта «{acc['name']}»:", reply_markup=kb)
+    return EDIT_SELECT_CLIENT
+
+async def edit_select_client_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Шаг 3: показываем карточку клиента с кнопками изменить поля"""
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split("_")
+    ai, ci = int(parts[1]), int(parts[2])
+    ctx.user_data["edit_ai"] = ai
+    ctx.user_data["edit_ci"] = ci
+
+    db = load_db()
+    u  = get_user(db, q.from_user.id)
+    try:
+        acc = u["accounts"][ai]
+        cl  = acc["clients"][ci]
+    except (IndexError, KeyError):
+        await q.message.reply_text("Ошибка: клиент не найден.", reply_markup=main_kb())
+        return MAIN_MENU
+
+    text = (
+        f"✏️ *Редактирование клиента*\n\n"
+        f"👤 Аккаунт: {acc['name']}\n"
+        f"📌 Имя: {cl.get('name','—')}\n"
+        f"📞 Телефон: {cl.get('phone','—')}\n"
+        f"ℹ️ Инфо: {cl.get('info','—')}\n\n"
+        f"Выбери что изменить:"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Изменить имя",     callback_data=f"chfield_{ai}_{ci}_name"),
+         InlineKeyboardButton("📞 Изменить телефон", callback_data=f"chfield_{ai}_{ci}_phone")],
+        [InlineKeyboardButton("ℹ️ Изменить инфо",    callback_data=f"chfield_{ai}_{ci}_info")],
+        [InlineKeyboardButton("🔙 Назад к списку",   callback_data=f"editacc_{ai}")],
+    ])
+    await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+    return EDIT_SELECT_CLIENT
+
+async def edit_choose_field_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Шаг 4: пользователь нажал «Изменить имя/телефон/инфо»"""
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split("_")
+    ai, ci, field = int(parts[1]), int(parts[2]), parts[3]
+    ctx.user_data["edit_ai"]    = ai
+    ctx.user_data["edit_ci"]    = ci
+    ctx.user_data["edit_field"] = field
+
+    field_names = {"name": "имя", "phone": "телефон", "info": "информацию"}
+    await q.message.reply_text(
+        f"Введи новое {field_names.get(field, field)} клиента:\n\n"
+        f"_(или нажми «🔙 Назад» чтобы отменить)_",
+        parse_mode="Markdown",
+        reply_markup=back_kb(),
+    )
+    return EDIT_FIELD_VALUE
+
+async def edit_save_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Шаг 5: сохраняем новое значение и показываем обновлённую карточку"""
+    if update.message.text == "🔙 Назад":
+        await update.message.reply_text("Отменено.", reply_markup=main_kb())
+        ctx.user_data.clear()
+        return MAIN_MENU
+
+    new_val = update.message.text.strip()
+    ai    = ctx.user_data.get("edit_ai", 0)
+    ci    = ctx.user_data.get("edit_ci", 0)
+    field = ctx.user_data.get("edit_field", "name")
+
+    db = load_db()
+    u  = get_user(db, update.effective_user.id)
+    try:
+        cl = u["accounts"][ai]["clients"][ci]
+        cl[field] = new_val
+        save_db(db)
+
+        acc_name = u["accounts"][ai]["name"]
+        field_names = {"name": "Имя", "phone": "Телефон", "info": "Информация"}
+
+        # Показываем обновлённую карточку
+        text = (
+            f"✅ *{field_names.get(field, field)} обновлено!*\n\n"
+            f"👤 Аккаунт: {acc_name}\n"
+            f"📌 Имя: {cl.get('name','—')}\n"
+            f"📞 Телефон: {cl.get('phone','—')}\n"
+            f"ℹ️ Инфо: {cl.get('info','—')}"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Изменить имя",     callback_data=f"chfield_{ai}_{ci}_name"),
+             InlineKeyboardButton("📞 Изменить телефон", callback_data=f"chfield_{ai}_{ci}_phone")],
+            [InlineKeyboardButton("ℹ️ Изменить инфо",    callback_data=f"chfield_{ai}_{ci}_info")],
+            [InlineKeyboardButton("🏠 В главное меню",   callback_data="goto_main")],
+        ])
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+    except (IndexError, KeyError):
+        await update.message.reply_text("Ошибка при сохранении.", reply_markup=main_kb())
+        ctx.user_data.clear()
+        return MAIN_MENU
+
+    return EDIT_SELECT_CLIENT
+
+# ═════════════════════════════════════════════════════════════════════════════
+# INLINE CALLBACKS (общий обработчик)
 # ═════════════════════════════════════════════════════════════════════════════
 async def inline_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
     data = q.data
     await q.answer()
+
+    # ── Главное меню (кнопка из карточки редактирования) ──
+    if data == "goto_main":
+        ctx.user_data.clear()
+        await q.message.reply_text("Главное меню:", reply_markup=main_kb())
+        return MAIN_MENU
+
+    # ── Выбор аккаунта при редактировании (из inline_handler) ──
+    if data.startswith("editacc_"):
+        ai = int(data.split("_")[1])
+        ctx.user_data["edit_ai"] = ai
+        db = load_db()
+        u  = get_user(db, q.from_user.id)
+        try:
+            acc = u["accounts"][ai]
+        except IndexError:
+            await q.message.reply_text("Ошибка.", reply_markup=main_kb())
+            return MAIN_MENU
+        clients = acc.get("clients", [])
+        if not clients:
+            await q.message.reply_text("В этом аккаунте нет клиентов.", reply_markup=main_kb())
+            return MAIN_MENU
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"📌 {cl.get('name','—')}", callback_data=f"editcl_{ai}_{ci}")]
+            for ci, cl in enumerate(clients)
+        ])
+        await q.message.reply_text(f"Выбери клиента из аккаунта «{acc['name']}»:", reply_markup=kb)
+        return EDIT_SELECT_CLIENT
+
+    # ── Выбор клиента для редактирования (из inline_handler) ──
+    if data.startswith("editcl_"):
+        parts = data.split("_")
+        ai, ci = int(parts[1]), int(parts[2])
+        ctx.user_data["edit_ai"] = ai
+        ctx.user_data["edit_ci"] = ci
+        db = load_db()
+        u  = get_user(db, q.from_user.id)
+        try:
+            acc = u["accounts"][ai]
+            cl  = acc["clients"][ci]
+        except (IndexError, KeyError):
+            await q.message.reply_text("Ошибка.", reply_markup=main_kb())
+            return MAIN_MENU
+        text = (
+            f"✏️ *Редактирование клиента*\n\n"
+            f"👤 Аккаунт: {acc['name']}\n"
+            f"📌 Имя: {cl.get('name','—')}\n"
+            f"📞 Телефон: {cl.get('phone','—')}\n"
+            f"ℹ️ Инфо: {cl.get('info','—')}\n\n"
+            f"Выбери что изменить:"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Изменить имя",     callback_data=f"chfield_{ai}_{ci}_name"),
+             InlineKeyboardButton("📞 Изменить телефон", callback_data=f"chfield_{ai}_{ci}_phone")],
+            [InlineKeyboardButton("ℹ️ Изменить инфо",    callback_data=f"chfield_{ai}_{ci}_info")],
+            [InlineKeyboardButton("🔙 Назад к списку",   callback_data=f"editacc_{ai}")],
+        ])
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        return EDIT_SELECT_CLIENT
+
+    # ── Выбор поля для изменения (из inline_handler) ──
+    if data.startswith("chfield_"):
+        parts = data.split("_")
+        ai, ci, field = int(parts[1]), int(parts[2]), parts[3]
+        ctx.user_data["edit_ai"]    = ai
+        ctx.user_data["edit_ci"]    = ci
+        ctx.user_data["edit_field"] = field
+        field_names = {"name": "имя", "phone": "телефон", "info": "информацию"}
+        await q.message.reply_text(
+            f"Введи новое {field_names.get(field, field)} клиента:",
+            reply_markup=back_kb(),
+        )
+        return EDIT_FIELD_VALUE
 
     # ── Delete account ──
     if data.startswith("delacc_"):
@@ -349,7 +575,7 @@ async def inline_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Введи имя клиента:", reply_markup=back_kb())
         return ADD_CLIENT_NAME
 
-    # ── View client detail (with edit/task buttons) ──
+    # ── View client detail ──
     if data.startswith("viewclient_"):
         _, ai, ci = data.split("_")
         ai, ci = int(ai), int(ci)
@@ -401,7 +627,7 @@ async def inline_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("Ошибка.")
         return MAIN_MENU
 
-    # ── Edit client fields ──
+    # ── Edit client fields (из viewclient) ──
     if data.startswith("edn_"):
         _, ai, ci = data.split("_")
         ctx.user_data["edit_ai"] = int(ai)
@@ -424,7 +650,7 @@ async def inline_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Введи новую информацию:", reply_markup=back_kb())
         return EDIT_CLIENT_INFO
 
-    # ── Add task to existing client ──
+    # ── Add task ──
     if data.startswith("addt_"):
         _, ai, ci = data.split("_")
         ctx.user_data["edit_ai"] = int(ai)
@@ -466,7 +692,7 @@ async def inline_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("Ошибка.")
         return MAIN_MENU
 
-    # ── Toggle task menu ──
+    # ── Toggle task ──
     if data.startswith("togglemenu_"):
         _, ai, ci = data.split("_")
         ai, ci = int(ai), int(ci)
@@ -702,10 +928,11 @@ def main():
         entry_points=[CommandHandler("start", start)],
         states={
             MAIN_MENU: [
-                MessageHandler(filters.Regex("^📋 Мой блокнот$"),        show_notebook),
-                MessageHandler(filters.Regex("^👤 Добавить аккаунт$"),   add_account_start),
-                MessageHandler(filters.Regex("^➕ Добавить клиента$"),   add_client_start),
-                MessageHandler(filters.Regex("^🗑 Удалить аккаунт$"),    delete_account_start),
+                MessageHandler(filters.Regex("^📋 Мой блокнот$"),           show_notebook),
+                MessageHandler(filters.Regex("^👤 Добавить аккаунт$"),      add_account_start),
+                MessageHandler(filters.Regex("^➕ Добавить клиента$"),      add_client_start),
+                MessageHandler(filters.Regex("^✏️ Редактировать клиента$"), edit_client_start),
+                MessageHandler(filters.Regex("^🗑 Удалить аккаунт$"),       delete_account_start),
                 CallbackQueryHandler(inline_handler),
             ],
             ADD_ACCOUNT_NAME:          [MessageHandler(filters.TEXT & ~filters.COMMAND, add_account_save)],
@@ -718,6 +945,16 @@ def main():
             EDIT_CLIENT_PHONE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_client_phone)],
             EDIT_CLIENT_INFO:          [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_client_info)],
             ADD_CLIENT_TASK:           [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_task)],
+            # Новые состояния для редактирования через кнопку меню
+            EDIT_SELECT_ACCOUNT: [CallbackQueryHandler(edit_select_account_cb, pattern="^editacc_")],
+            EDIT_SELECT_CLIENT:  [
+                CallbackQueryHandler(edit_select_client_cb,  pattern="^editcl_"),
+                CallbackQueryHandler(edit_choose_field_cb,   pattern="^chfield_"),
+                CallbackQueryHandler(inline_handler,         pattern="^(editacc_|goto_main)"),
+            ],
+            EDIT_FIELD_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_field),
+            ],
             ADMIN_MENU: [
                 MessageHandler(filters.Regex("^👥 Все пользователи$"),   admin_all_users),
                 MessageHandler(filters.Regex("^✉️ Написать менеджеру$"), admin_write_select),
@@ -741,7 +978,7 @@ def main():
         allowed_updates=Update.ALL_TYPES,
     )
 
-# ── Resilient entry point — restarts bot on any crash ─────────────────────────
+# ── Resilient entry point ─────────────────────────────────────────────────────
 def run_forever():
     RETRY_DELAY = 5
     MAX_DELAY   = 60
