@@ -9,8 +9,8 @@ primary_region = "fra"
 [processes]
   app = "python bot.py"
 
-# No [[services]] block — polling bot needs zero inbound ports.
-# Without it Fly.io treats this as a pure worker and never idles it.
+# Без [[services]] — polling-бот не нуждается в входящих портах.
+# Fly.io не будет его «усыплять» если нет http_service.
 
 [[vm]]
   memory = "256mb"
@@ -20,3 +20,8 @@ primary_region = "fra"
 [mounts]
   source = "bot_data"
   destination = "/data"
+
+# ✅ Запрет авто-остановки машины
+[machine]
+  auto_stop_seconds = 0
+
